@@ -4,6 +4,7 @@
   "main": "index.ts",
   "license": "MIT",
   "dependencies": {
+    "dotenv": "^16.4.5",
     "ethers": "^5.7.0",
     "zksync-web3": "^0.13.0"
   },
@@ -19,6 +20,7 @@
   },
   "scripts": {
     "start": "ts-node src/index.ts",
+    "withdraw": "ts-node scripts/withdraw.ts",
     "test": "mocha -r ts-node/register tests/*",
     "lint": "yarn prettier --config prettier-config.js --check src/*.ts",
     "lint:fix": "yarn prettier --config prettier-config.js --write src/*.ts"
