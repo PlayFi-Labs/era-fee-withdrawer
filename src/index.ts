@@ -1,13 +1,19 @@
+import * as dotenv from 'dotenv';
 import * as ethers from 'ethers';
 import * as zkweb3 from 'zksync-web3';
 import { BigNumber } from 'ethers';
 import { isOperationFeeAcceptable, minBigNumber, maxBigNumber } from './utils';
 import { calculateTransferAmount } from './transfer-calculator';
 
+dotenv.config();
+
 /** Env parameters */
 
 /** L2 fee account PK */
 const FEE_ACCOUNT_PRIVATE_KEY = process.env.MISC_FEE_ACCOUNT_PRIVATE_KEY;
+
+/** L1 fee distributor PK */
+const L1_FEE_DISTRIBUTOR_PRIVATE_KEY = process.env.MISC_L1_FEE_DISTRIBUTOR_PRIVATE_KEY;
 
 /** Addresses of accounts to distribute ETH among */
 const OPERATOR_ADDRESS = process.env.OPERATOR_ADDRESS;
@@ -47,7 +53,9 @@ const L2_ETH_TRANSFER_THRESHOLD = process.env.L2_ETH_TRANSFER_THRESHOLD
     ? ethers.utils.parseEther(process.env.L2_ETH_TRANSFER_THRESHOLD)
     : ethers.utils.parseEther('1.0');
 
-async function withdrawForL1TopUps(wallet: zkweb3.Wallet) {
+const AWAIT_L1_DEPOSIT = process.env.AWAIT_L1_DEPOSIT;
+
+async function withdrawForL1TopUps(wallet: zkweb3.Wallet, walletEth: zkweb3.Wallet) {
     // There should be reserve of `L2_ETH_TRANSFER_THRESHOLD` amount on L2
     let balance = await wallet.getBalance(zkweb3.utils.ETH_ADDRESS);
     let amount = balance.sub(L2_ETH_TRANSFER_THRESHOLD);
@@ -65,7 +73,7 @@ async function withdrawForL1TopUps(wallet: zkweb3.Wallet) {
         token: zkweb3.utils.ETH_ADDRESS,
         amount,
         from: wallet.address,
-        to: wallet.address
+        to: walletEth.address
     });
     const gasLimit = await wallet.provider.estimateGas(tx);
     const gasPrice = await wallet.provider.getGasPrice();
@@ -76,7 +84,7 @@ async function withdrawForL1TopUps(wallet: zkweb3.Wallet) {
         const withdrawHandle = await wallet.withdraw({
             token: zkweb3.utils.ETH_ADDRESS,
             amount,
-            to: wallet.address,
+            to: walletEth.address,
             overrides: {
                 gasPrice,
                 gasLimit
@@ -87,8 +95,15 @@ async function withdrawForL1TopUps(wallet: zkweb3.Wallet) {
             `Withdrawing ETH, amount: ${ethers.utils.formatEther(amount)}, fee: ${ethers.utils.formatEther(fee)}, tx hash: ${hash}`
         );
 
-        await withdrawHandle.wait();
         console.log(`Withdrawal L2 tx has succeeded, tx hash: ${hash}`);
+
+        if(AWAIT_L1_DEPOSIT) {
+            await withdrawHandle.waitFinalize();
+            const finalizeWithdrawTx = await walletEth.finalizeWithdrawal(hash);
+            const receipt = await finalizeWithdrawTx.wait();
+            console.log(`Withdrawal L2 tx has been verified on L1, tx hash: ${receipt.transactionHash}`);
+        }
+
     } else {
         console.log('Skipping withdrawing, fee slippage is too big');
     }
@@ -188,7 +203,8 @@ async function sendETH(ethWallet: ethers.Wallet, to: string, amount: BigNumber) 
     console.log('Providers are initialized');
 
     const wallet = new zkweb3.Wallet(FEE_ACCOUNT_PRIVATE_KEY, zksyncProvider, ethProvider);
-    const ethWallet = new ethers.Wallet(FEE_ACCOUNT_PRIVATE_KEY, ethProvider);
+    const ethWallet = !L1_FEE_DISTRIBUTOR_PRIVATE_KEY ? new ethers.Wallet(FEE_ACCOUNT_PRIVATE_KEY, ethProvider) : new ethers.Wallet(L1_FEE_DISTRIBUTOR_PRIVATE_KEY, ethProvider);
+    const zkWallet = !L1_FEE_DISTRIBUTOR_PRIVATE_KEY ? new zkweb3.Wallet(FEE_ACCOUNT_PRIVATE_KEY, zksyncProvider,ethProvider) : new zkweb3.Wallet(L1_FEE_DISTRIBUTOR_PRIVATE_KEY, zksyncProvider, ethProvider);
     console.log('Wallets are initialized');
 
     try {
@@ -199,7 +215,7 @@ async function sendETH(ethWallet: ethers.Wallet, to: string, amount: BigNumber) 
 
         console.log(`----------------------------------------------------------------------------`);
         // get initial balances
-        let l1feeAccountBalance = await ethProvider.getBalance(wallet.address);
+        let l1feeAccountBalance = await ethProvider.getBalance(ethWallet.address);
         console.log(`Fee account L1 balance before top-up: ${ethers.utils.formatEther(l1feeAccountBalance)}`);
 
         let l2feeAccountBalance = await zksyncProvider.getBalance(wallet.address);
@@ -207,11 +223,15 @@ async function sendETH(ethWallet: ethers.Wallet, to: string, amount: BigNumber) 
 
         const operatorBalance = await ethProvider.getBalance(OPERATOR_ADDRESS);
         console.log(`Operator L1 balance before top-up: ${ethers.utils.formatEther(operatorBalance)}`);
-        
-        const blobOperatorBalance = await ethProvider.getBalance(BLOB_OPERATOR_ADDRESS);
+
+        const blobOperatorBalance = BLOB_OPERATOR_ADDRESS
+            ? await zksyncProvider.getBalance(BLOB_OPERATOR_ADDRESS)
+            : BigNumber.from(0);
         console.log(`Blob Operator L1 balance before top-up: ${ethers.utils.formatEther(blobOperatorBalance)}`);
 
-        const withdrawerBalance = await ethProvider.getBalance(WITHDRAWAL_FINALIZER_ETH_ADDRESS);
+        const withdrawerBalance = WITHDRAWAL_FINALIZER_ETH_ADDRESS
+            ? await zksyncProvider.getBalance(WITHDRAWAL_FINALIZER_ETH_ADDRESS)
+            : BigNumber.from(0);
         console.log(`Withdrawer L1 balance before top-up: ${ethers.utils.formatEther(withdrawerBalance)}`);
 
         const paymasterL2Balance = TESTNET_PAYMASTER_ADDRESS
@@ -219,7 +239,9 @@ async function sendETH(ethWallet: ethers.Wallet, to: string, amount: BigNumber) 
             : BigNumber.from(0);
         console.log(`Paymaster L2 balance before top-up: ${ethers.utils.formatEther(paymasterL2Balance)}`);
 
-        const watchdogBalance = await zksyncProvider.getBalance(WATCHDOG_ADDRESS);
+        const watchdogBalance = WATCHDOG_ADDRESS
+            ? await zksyncProvider.getBalance(WATCHDOG_ADDRESS)
+            : BigNumber.from(0);
         console.log(`Watchdog L2 balance before top-up: ${ethers.utils.formatEther(watchdogBalance)}`);
 
         console.log(`----------------------------------------------------------------------------`);
@@ -270,12 +292,12 @@ async function sendETH(ethWallet: ethers.Wallet, to: string, amount: BigNumber) 
         console.log(`----------------------------------------------------------------------------`);
 
         console.log('Step 3 - withdrawing tokens from ZkSync');
-        await withdrawForL1TopUps(wallet);
+        await withdrawForL1TopUps(wallet, zkWallet);
 
         l2feeAccountBalance = await wallet.getBalance(wallet.address);
         console.log(`L2 fee account balance after withdraw: ${ethers.utils.formatEther(l2feeAccountBalance)} ETH`);
 
-        l1feeAccountBalance = await ethProvider.getBalance(wallet.address);
+        l1feeAccountBalance = await ethProvider.getBalance(ethWallet.address);
         console.log(`L1 fee account balance after withdraw: ${ethers.utils.formatEther(l1feeAccountBalance)} ETH`);
 
         console.log(`----------------------------------------------------------------------------`);
